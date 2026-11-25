@@ -1,0 +1,32 @@
+'use strict';
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {execFileSync} = require('node:child_process');
+const assert = require('node:assert/strict');
+const root = path.resolve(__dirname,'..');
+const temp = fs.mkdtempSync(path.join(os.tmpdir(),'task-runner-install-'));
+const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const invoke = (args,cwd) => execFileSync(npm,args,{cwd,encoding:'utf8',stdio:['ignore','pipe','pipe']});
+try {
+ const [packed] = JSON.parse(invoke(['pack','--ignore-scripts','--json','--pack-destination',temp],root));
+ const consumer=path.join(temp,'consumer');
+ fs.mkdirSync(consumer);
+ fs.writeFileSync(path.join(consumer,'package.json'),JSON.stringify({private:true}));
+ invoke(['install','--omit=dev','--ignore-scripts','--no-audit','--no-fund',path.join(temp,packed.filename)],consumer);
+ const installed=path.join(consumer,'node_modules/@thinkiac/module-task-runner');
+ assert.ok(fs.existsSync(path.join(installed,'dist/index.cjs')));
+ assert.ok(!fs.existsSync(path.join(consumer,'node_modules/logostype')));
+ const api=require(installed);
+ assert.equal(api.registry(),'https://registry.npmjs.org');
+ const project=path.join(temp,'project');
+ fs.mkdirSync(path.join(project,'packages/a'),{recursive:true});
+ fs.writeFileSync(path.join(project,'package.json'),JSON.stringify({private:true,workspaces:['packages/*']}));
+ fs.writeFileSync(path.join(project,'logos.tasks.json'),JSON.stringify({version:1,tasks:{build:{}}}));
+ fs.writeFileSync(path.join(project,'packages/a/package.json'),JSON.stringify({name:'a',scripts:{build:'node -e ""'}}));
+ const cli=path.join(installed,'cli.cjs');
+ const result=execFileSync(process.execPath,[cli,'run','build','--root',project,'--dry-run'],{encoding:'utf8'});
+ assert.equal(JSON.parse(result).tasks[0].id,'a#build');
+ execFileSync(process.execPath,[cli,'run','build','--root',project],{encoding:'utf8'});
+ console.log('Isolated package: API, CLI dry-run and real npm task passed without compiler.');
+} finally { fs.rmSync(temp,{recursive:true,force:true}); }

@@ -1,0 +1,78 @@
+{ findRoot, plan, run, registry, startProcess, killTree } = require './index.cjs'
+
+main = (argv, context) ->
+  argv = process.argv.slice(2) if argv is undefined
+  context = {} if context is undefined
+  if not argv.length or argv.includes '--help'
+    console.log 'logos tasks run <task...> [--filter <name|path>] [--concurrency <n>] [--dry-run] [--no-cache]\nlogos tasks install [--ci] [--registry <url>]\nOptions: --root <workspace>. Configuration: logos.tasks.json'
+    return 0
+  command = argv[0]
+  options = { filters: [] }
+  tasks = []
+  root = context.root
+  selectedRegistry = undefined
+  ci = false
+  i = 1
+  while i < argv.length
+    arg = argv[i]
+    if arg in ['--root', '--filter', '--concurrency', '--registry']
+      value = argv[++i]
+      throw new Error "Missing value: #{arg}" if not value or value.startsWith '--'
+      root = value if arg is '--root'
+      options.filters.push value if arg is '--filter'
+      options.concurrency = Number value if arg is '--concurrency'
+      selectedRegistry = value if arg is '--registry'
+    else if arg is '--dry-run' then options.dryRun = true
+    else if arg is '--no-cache' then options.cache = false
+    else if arg is '--ci' then ci = true
+    else if arg.startsWith '-' then throw new Error "Unknown option: #{arg}"
+    else tasks.push arg
+    i++
+  root = findRoot root
+  throw new Error "Unknown command: #{command}" unless command in ['run', 'install']
+  throw new Error '--ci and --registry are install options' if command is 'run' and (ci or selectedRegistry)
+  if command is 'install' and (tasks.length or options.filters.length or options.concurrency isnt undefined or options.dryRun or options.cache is false)
+    throw new Error 'install only accepts --ci, --registry and --root'
+  controller = new AbortController()
+  exitCode = 0
+  interrupt = ->
+    exitCode = 130
+    controller.abort()
+  terminate = ->
+    exitCode = 143
+    controller.abort()
+  process.once 'SIGINT', interrupt
+  process.once 'SIGTERM', terminate
+  try
+    if command is 'run'
+      graph = plan root, tasks, options
+      if options.dryRun
+        console.log JSON.stringify { root, tasks: [...graph.nodes.values()].map ({ id, dependencies, script, rule }) ->
+          { id, dependencies, script: script or null, persistent: !!rule.persistent, cache: rule.cache is true }
+        }, null, 2
+      else await run graph, { ...options, signal: controller.signal }
+    else
+      { configuration } = require './index.cjs'
+      configuredRegistry = selectedRegistry or configuration(root).registry
+      registryArgs = if configuredRegistry then ['--registry', registry(configuredRegistry)] else []
+      proc = startProcess (if process.platform is 'win32' then 'npm.cmd' else 'npm'), [(if ci then 'ci' else 'install'), ...registryArgs], { cwd: root, env: { ...process.env }, log: console.log, id: 'install' }
+      timer = undefined
+      cancel = ->
+        killTree proc.child, 'SIGTERM'
+        timer = setTimeout (-> killTree proc.child, 'SIGKILL'), 1500
+      controller.signal.addEventListener 'abort', cancel, once: true
+      try
+        await proc.done
+      finally
+        controller.signal.removeEventListener 'abort', cancel
+        clearTimeout timer
+        killTree proc.child, 'SIGKILL' if controller.signal.aborted
+    exitCode
+  catch error
+    return exitCode if exitCode
+    throw error
+  finally
+    process.removeListener 'SIGINT', interrupt
+    process.removeListener 'SIGTERM', terminate
+
+module.exports = { main }

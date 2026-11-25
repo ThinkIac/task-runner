@@ -1,0 +1,39 @@
+{
+  "name": "@thinkiac/module-task-runner",
+  "version": "0.1.0",
+  "description": "External workspace task orchestration module for Logos",
+  "main": "index.cjs",
+  "bin": {
+    "logos-tasks": "cli.cjs"
+  },
+  "files": [
+    "*.cjs",
+    "src",
+    "dist",
+    "scripts",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.cjs test/*.test.mjs",
+    "test:isolated": "npm run build && node scripts/isolated.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "registry": "https://npm.thinkiac.cloud",
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThinkIac/task-runner.git"
+  },
+  "devDependencies": {
+    "logostype": "git+https://github.com/ThinkIac/LogosType.git#acdcc6032ab94219e0d4a4d25b1538fb55fa19cf"
+  }
+}

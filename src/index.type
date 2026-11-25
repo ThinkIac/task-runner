@@ -1,0 +1,297 @@
+fs = require 'node:fs'
+path = require 'node:path'
+crypto = require 'node:crypto'
+{ spawn } = require 'node:child_process'
+{ createInterface } = require 'node:readline'
+DEFAULT_REGISTRY = 'https://registry.npmjs.org'
+read = (file) -> JSON.parse fs.readFileSync(file, 'utf8')
+exists = (file) -> fs.existsSync file
+slash = (value) -> value.split(path.sep).join '/'
+
+findRoot = (start) ->
+  start = process.cwd() if start is undefined
+  dir = path.resolve start
+  loop
+    file = path.join dir, 'package.json'
+    return dir if exists(file) and read(file).workspaces
+    parent = path.dirname dir
+    throw new Error 'No workspace package.json found' if parent is dir
+    dir = parent
+
+discover = (root) ->
+  manifest = read path.join(root, 'package.json')
+  patterns = if Array.isArray(manifest.workspaces) then manifest.workspaces else manifest.workspaces?.packages
+  throw new Error 'workspaces must be an array or { packages: [] }' unless Array.isArray patterns
+  dirs = new Set()
+  for pattern in patterns
+    if typeof pattern isnt 'string' or /[!{}?\\\\]/.test(pattern) or pattern.includes('**') or path.isAbsolute(pattern) or pattern.split('/').includes('..')
+      throw new Error "Unsupported workspace pattern: #{pattern}"
+    current = [root]
+    for segment in pattern.split '/'
+      matcher = new RegExp '^' + segment.split('*').map((s) -> s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*') + '$'
+      current = current.flatMap (dir) ->
+        return [] unless exists dir
+        fs.readdirSync(dir, withFileTypes: true)
+          .filter (entry) -> entry.isDirectory() and entry.name isnt 'node_modules' and not entry.name.startsWith('.') and matcher.test(entry.name)
+          .map (entry) -> path.join dir, entry.name
+    for dir in current when exists path.join(dir, 'package.json')
+      dirs.add dir
+  packages = new Map()
+  for dir in [...dirs].sort()
+    pkg = read path.join(dir, 'package.json')
+    throw new Error "Package without name: #{dir}" unless pkg.name
+    throw new Error "Duplicate workspace name: #{pkg.name}" if packages.has pkg.name
+    packages.set pkg.name, { name: pkg.name, dir, manifest: pkg }
+  packages
+
+configuration = (root) ->
+  file = path.join root, 'logos.tasks.json'
+  throw new Error 'Missing logos.tasks.json' unless exists file
+  config = read file
+  for key in Object.keys config
+    throw new Error "Unknown configuration field: #{key}" unless key in ['version', 'registry', 'tasks']
+  unless config.version is 1 and config.tasks and typeof config.tasks is 'object'
+    throw new Error 'Expected version: 1 and tasks in logos.tasks.json'
+  for [name, task] in Object.entries config.tasks
+    throw new Error "Invalid task: #{name}" if not task or typeof task isnt 'object' or Array.isArray(task)
+    for key in Object.keys task
+      throw new Error "Unknown task field: #{name}.#{key}" unless key in ['dependsOn', 'outputs', 'cache', 'persistent']
+    throw new Error "Invalid dependsOn: #{name}" if task.dependsOn isnt undefined and not Array.isArray(task.dependsOn)
+    for key in ['cache', 'persistent']
+      throw new Error "Invalid #{key}: #{name}" if task[key] isnt undefined and typeof task[key] isnt 'boolean'
+    outputRoots task
+  config
+
+outputRoots = (task) ->
+  throw new Error 'outputs must be an array' if task.outputs isnt undefined and not Array.isArray(task.outputs)
+  (task.outputs or []).map (pattern) ->
+    # Only owned directories; never guess at Turbo glob semantics.
+    unless typeof pattern is 'string' and /^[\w.-]+(?:\/[\w.-]+)*\/\*\*$/.test pattern
+      throw new Error "Output must be a directory/**: #{pattern}"
+    dir = pattern.slice 0, -3
+    if dir.split('/').some (s) -> s in ['.', '..', 'node_modules', '.git', '.logos-task-cache']
+      throw new Error "Unsafe output: #{pattern}"
+    dir
+
+plan = (root, taskNames, options) ->
+  options = {} if options is undefined
+  { filters } = options
+  filters = [] if filters is undefined
+  root = fs.realpathSync root
+  config = configuration root
+  packages = discover root
+  selected = if filters.length then [...packages.values()].filter((pkg) -> filters.includes(pkg.name) or filters.includes(slash(path.relative(root, pkg.dir)))) else [...packages.values()]
+  for filter in filters
+    unless selected.some (pkg) -> pkg.name is filter or slash(path.relative(root, pkg.dir)) is filter
+      throw new Error "Unknown workspace filter: #{filter}"
+  nodes = new Map()
+  visiting = []
+  add = (pkg, taskName, required = false) ->
+    id = "#{pkg.name}##{taskName}"
+    throw new Error "Task cycle: #{[...visiting, id].join(' -> ')}" if visiting.includes id
+    return id if nodes.has id
+    rule = config.tasks[id] or config.tasks[taskName]
+    throw new Error "Undefined task: #{id}" unless rule
+    script = pkg.manifest.scripts?[taskName]
+    throw new Error "Missing required script: #{id}" if required and not script
+    visiting.push id
+    node = { id, package: pkg.name, dir: pkg.dir, task: taskName, script, rule, dependencies: [] }
+    for raw in rule.dependsOn or []
+      dep = if typeof raw is 'string' then { task: raw } else raw
+      if not dep or typeof dep.task isnt 'string' or (dep.optional isnt undefined and typeof dep.optional isnt 'boolean') or Object.keys(dep).some((k) -> k not in ['task', 'optional'])
+        throw new Error "Invalid dependency in #{id}"
+      if dep.task.startsWith '^'
+        name = dep.task.slice 1
+        dependencies = { ...pkg.manifest.dependencies, ...pkg.manifest.devDependencies, ...pkg.manifest.optionalDependencies }
+        targets = Object.keys(dependencies).filter((key) -> packages.has key).map (key) -> packages.get key
+      else if dep.task.includes '#'
+        split = dep.task.lastIndexOf '#'
+        name = dep.task.slice split + 1
+        target = packages.get dep.task.slice(0, split)
+        throw new Error "Missing workspace: #{dep.task}" if not target and not dep.optional
+        targets = if target then [target] else []
+      else
+        name = dep.task
+        targets = [pkg]
+      for target in targets
+        continue if dep.optional and not target.manifest.scripts?[name]
+        childId = add target, name, not dep.task.startsWith('^') and not dep.optional
+        if nodes.get(childId).script and nodes.get(childId).rule.persistent
+          throw new Error "Persistent task cannot be a dependency: #{childId}"
+        node.dependencies.push childId
+    visiting.pop()
+    nodes.set id, node
+    id
+  throw new Error 'Provide at least one task' unless taskNames.length
+  for name in taskNames
+    throw new Error "Undefined task: #{name}" unless config.tasks[name]
+    for pkg in selected when pkg.manifest.scripts?[name]
+      add pkg, name
+  unless [...nodes.values()].some (node) -> node.script
+    throw new Error 'No matching task scripts'
+  { root, config, packages, nodes }
+
+digestTree = (root, ignored = new Set()) ->
+  hash = crypto.createHash 'sha256'
+  bytes = files = 0
+  walk = (dir) ->
+    for entry in fs.readdirSync(dir, withFileTypes: true).sort((a, b) -> a.name.localeCompare b.name)
+      continue if entry.name in ['node_modules', '.git', '.turbo', '.logos-task-cache']
+      file = path.join dir, entry.name
+      continue if ignored.has file
+      stat = fs.lstatSync file
+      if ++files > 100000 or (bytes += stat.size) > 64 * 1024 * 1024
+        throw new Error 'Fingerprint exceeds local cache scan budget (100000 entries / 64 MiB)'
+      hash.update JSON.stringify [slash(path.relative(root, file)), stat.mode]
+      throw new Error "Cache cannot fingerprint symlink: #{file}" if entry.isSymbolicLink()
+      if entry.isDirectory() then walk file
+      else if entry.isFile() then hash.update crypto.createHash('sha256').update(fs.readFileSync(file)).digest()
+      else throw new Error "Cache cannot fingerprint special file: #{file}"
+    return
+  walk root
+  hash.digest 'hex'
+
+registry = (value) ->
+  value = DEFAULT_REGISTRY if value is undefined
+  url = new URL value
+  if url.protocol not in ['https:', 'http:'] or url.username or url.password or url.search or url.hash
+    throw new Error 'Registry must be an HTTP(S) URL without embedded credentials'
+  url.href.replace /\/$/, ''
+
+startProcess = (command, args, { cwd, env, log, id }) ->
+  child = spawn command, args, { cwd, env, shell: false, detached: process.platform isnt 'win32', stdio: ['ignore', 'pipe', 'pipe'] }
+  for stream in [child.stdout, child.stderr]
+    createInterface(input: stream).on 'line', (line) -> log "[#{id}] #{line}"
+  done = new Promise (resolve, reject) ->
+    child.once 'error', reject
+    child.once 'close', (code, signal) ->
+      if code is 0 then resolve() else reject new Error "#{id} failed (#{signal or code})"
+  { child, done }
+
+killTree = (child, signal) ->
+  return unless child.pid
+  try
+    if process.platform is 'win32' then child.kill signal else process.kill -child.pid, signal
+  catch error
+    throw error unless error.code is 'ESRCH'
+  return
+
+run = (graph, options) ->
+  options = {} if options is undefined
+  { concurrency, signal, log, cache } = options
+  concurrency = 4 if concurrency is undefined
+  log = console.log if log is undefined
+  cache = true if cache is undefined
+  unless Number.isInteger(concurrency) and concurrency >= 1
+    throw new Error 'concurrency must be a positive integer'
+  nodes = [...graph.nodes.values()]
+  persistent = nodes.filter((n) -> n.script and n.rule.persistent).length
+  if persistent > concurrency or (persistent and nodes.some((n) -> n.script and not n.rule.persistent) and persistent >= concurrency)
+    throw new Error 'Increase concurrency to leave room for persistent tasks and prerequisites'
+  env = { ...process.env }
+  active = new Map()
+  completed = new Set()
+  results = []
+  cancelledChildren = new Set()
+  failure = killTimer = undefined
+  stop = (error) ->
+    return if failure
+    failure = error
+    for proc from active.values()
+      cancelledChildren.add proc.child
+      killTree proc.child, 'SIGTERM'
+    killTimer = setTimeout (->
+      killTree child, 'SIGKILL' for child from cancelledChildren
+      return
+    ), 1500
+    return
+  abort = -> stop new Error 'Task execution cancelled'
+  signal?.addEventListener 'abort', abort, once: true
+  ignored = new Set()
+  for pkg from graph.packages.values()
+    for rule in Object.values graph.config.tasks
+      ignored.add path.join(pkg.dir, output) for output in outputRoots rule
+  cacheDir = path.join graph.root, '.logos-task-cache'
+  cacheState = (node) ->
+    return null if not cache or node.rule.cache isnt true or node.rule.persistent or not node.rule.outputs?.length
+    try
+      inputs = digestTree graph.root, ignored
+      dependencyOutputs = []
+      visited = new Set()
+      fingerprintDependencies = (id) ->
+        return if visited.has id
+        visited.add id
+        dep = graph.nodes.get id
+        for output in outputRoots dep.rule
+          dir = path.join dep.dir, output
+          dependencyOutputs.push [id, output, if exists(dir) then digestTree(dir) else null]
+        dep.dependencies.forEach fingerprintDependencies
+        return
+      node.dependencies.forEach fingerprintDependencies
+      key = crypto.createHash('sha256').update(JSON.stringify([inputs, dependencyOutputs, node.id, node.script, graph.config, env, process.version, process.platform, process.arch])).digest 'hex'
+      outputs = outputRoots(node.rule).map (dir) -> path.join node.dir, dir
+      outputHash = -> outputs.map (dir) ->
+        if exists(dir) and fs.lstatSync(dir).isDirectory() and not fs.lstatSync(dir).isSymbolicLink() then digestTree(dir) else null
+      { file: path.join(cacheDir, key + '.json'), outputHash }
+    catch error
+      log "[#{node.id}] cache disabled: #{error.message}"
+      null
+  execute = (node) ->
+    return 'virtual' unless node.script
+    state = cacheState node
+    if state and exists state.file
+      try
+        hashes = state.outputHash()
+        if hashes.some(Boolean) and JSON.stringify(read(state.file)) is JSON.stringify(hashes)
+          log "[#{node.id}] cached"
+          return 'cached'
+      catch
+        # Unreadable receipt/output is a miss.
+    log "[#{node.id}] running"
+    proc = startProcess (if process.platform is 'win32' then 'npm.cmd' else 'npm'), ['run', node.task], { cwd: node.dir, env, log, id: node.id }
+    active.set node.id, proc
+    try
+      await proc.done
+      if state and not failure
+        try
+          hashes = state.outputHash()
+          if hashes.some Boolean
+            fs.mkdirSync cacheDir, recursive: true
+            temp = "#{state.file}.#{crypto.randomUUID()}.tmp"
+            fs.writeFileSync temp, JSON.stringify hashes
+            fs.renameSync temp, state.file
+        catch error
+          log "[#{node.id}] cache write skipped: #{error.message}"
+      'executed'
+    catch error
+      killTree proc.child, 'SIGKILL'
+      throw error
+    finally
+      active.delete node.id
+  pending = new Map()
+  try
+    abort() if signal?.aborted
+    while completed.size < nodes.length and not failure
+      for node in nodes
+        break if pending.size >= concurrency or failure
+        continue if completed.has(node.id) or pending.has(node.id) or not node.dependencies.every((id) -> completed.has id)
+        do (node) ->
+          promise = execute(node).then((status) ->
+            completed.add node.id
+            results.push { id: node.id, status }
+            return
+          , stop).finally -> pending.delete node.id
+          pending.set node.id, promise
+      unless pending.size
+        stop new Error 'Task graph made no progress' unless failure
+        break
+      await Promise.race pending.values()
+    await Promise.all pending.values()
+    throw failure if failure
+    results
+  finally
+    signal?.removeEventListener 'abort', abort
+    clearTimeout killTimer
+    killTree child, 'SIGKILL' for child from cancelledChildren
+
+module.exports = { DEFAULT_REGISTRY, findRoot, discover, configuration, plan, run, registry, startProcess, killTree }
